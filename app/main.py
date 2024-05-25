@@ -6,7 +6,7 @@ class Connection(Thread):
         super().__init__()
         self.sock = socket
         self.addr = address
-        print("Connection from {address}")
+        print(f"Connection from {address}")
         self.start()
 
     def run(self):
