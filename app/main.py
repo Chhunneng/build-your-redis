@@ -6,6 +6,7 @@ class Connection(Thread):
         super().__init__()
         self.sock = socket
         self.addr = address
+        self.data = {}
         print(f"Connection from {address}")
         self.start()
 
@@ -27,6 +28,15 @@ class Connection(Thread):
             case "echo":
                 print(f"ECHOING! {req[1]}")
                 self.sock.send(f"+{req[1]}\r\n".encode())
+            case "set":
+                self.data[req[1]] = req[2]
+                self.sock.send("+OK\r\n".encode())
+            case "get":
+                if req[1] in self.data:
+                    self.sock.send(f"+{self.data[req[1]]}\r\n".encode())
+                else:
+                    self.sock.send("-1\r\n".encode())
+
 def main():
     print("STARTED!")
     server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
