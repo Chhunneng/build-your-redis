@@ -81,4 +81,8 @@ if __name__ == "__main__":
         master_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         master_sock.connect((master_host, master_port))
         master_sock.send("*1\r\n$4\r\nping\r\n".encode())
+        master_sock.recv(1024).decode()
+        master_sock.send(
+            f"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n{args.port}\r\n*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n".encode()
+        )
     main()
