@@ -61,7 +61,7 @@ class Connection(Thread):
 def main():
     print("STARTED!")
     server_socket = socket.create_server(
-        ("localhost", parser.parse_args().port), reuse_port=True
+        ("localhost", args.port), reuse_port=True
     )
     while True:
         client, client_addr = server_socket.accept()  # wait for client
@@ -72,5 +72,13 @@ if __name__ == "__main__":
     parser = ArgumentParser("A Redis server written in Python")
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--replicaof", nargs="+", help="Replica server host and port")
-    role = "master" if not parser.parse_args().replicaof else "slave"
+    args = parser.parse_args()
+    role = "master" if not args.replicaof else "slave"
+    if args.replicaof and len(args.replicaof[0].split()) == 2:
+        master_info = args.replicaof[0].split()
+        master_host = master_info[0]
+        master_port = int(master_info[1])
+        master_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        master_sock.connect((master_host, master_port))
+        master_sock.send("*1\r\n$4\r\nping\r\n".encode())
     main()
