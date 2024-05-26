@@ -51,6 +51,10 @@ class Connection(Thread):
                     self.sock.send(f"+{self.data[req[1]]}\r\n".encode())
                 else:
                     self.sock.send("$-1\r\n".encode())
+            case "info":
+                if req[1].lower() == "replication":
+                    self.sock.send("$11\r\nrole:master\r\n".encode())
+
 
 
 def main():
