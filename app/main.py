@@ -52,7 +52,10 @@ class Connection(Thread):
                     self.sock.send("$-1\r\n".encode())
             case "info":
                 if req[1].lower() == "replication":
-                    self.sock.send(f"${5 + len(role)}\r\nrole:{role}\r\n".encode())
+                    result = f"role:{role}\r\n"
+                    result += f"master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\r\n"
+                    result += f"master_repl_offset:0\r\n"
+                    self.sock.send(f"${len(result)}\r\n{result}\r\n".encode())
 
 
 def main():
