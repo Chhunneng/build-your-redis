@@ -1,7 +1,8 @@
 import socket
 import os
-from threading import *
+from threading import Thread
 from time import time
+from argparse import ArgumentParser
 
 
 class Connection(Thread):
@@ -54,7 +55,9 @@ class Connection(Thread):
 
 def main():
     print("STARTED!")
-    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    parser = ArgumentParser("A Redis server written in Python")
+    parser.add_argument("--port", type=int, default=6379)
+    server_socket = socket.create_server(("localhost", parser.parse_args().port), reuse_port=True)
     while True:
         client, client_addr = server_socket.accept()  # wait for client
         Connection(client, client_addr)
