@@ -242,6 +242,8 @@ class Connection(Thread):
                     )
             case "replconf":
                 self.sock.send(_encode_resp("OK"))
+            case "psync":
+                self.sock.send(_encode_resp(f"FULLRESYNC {self.settings.replid} 0"))
 
 def main(settings: _Settings):
     print("STARTED!")
