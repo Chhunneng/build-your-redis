@@ -125,7 +125,7 @@ def _parse_resp(it):
 
 def _encode_resp(value, resp3=False, is_array=False) -> bytes:
     if isinstance(value, (bytes, bytearray, str)):
-        binary_data = value.encode("utf-8") if isinstance(value, str) else value
+        binary_data = value.encode() if isinstance(value, str) else value
         # FIXME: 2n
         is_simple = b"\n" not in binary_data and b"\r" not in binary_data
         if is_simple:
@@ -240,6 +240,8 @@ class Connection(Thread):
                             )
                         )
                     )
+            case "replconf":
+                self.sock.send(_encode_resp("OK"))
 
 def main(settings: _Settings):
     print("STARTED!")
