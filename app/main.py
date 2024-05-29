@@ -9,6 +9,7 @@ import random
 data = {}
 expiry_time = {}
 rdb = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
+replicas: list[socket.socket] = []
 
 
 class _Settings:
@@ -219,6 +220,8 @@ class Connection(Thread):
                     additional_time = int(req[4])
                     expiry_time[req[1]] = additional_time + (time() * 1000)
                 self.sock.send(_encode_resp("OK"))
+                for rep in replicas:
+                    rep.sendall(_encode_resp(req))
             case "get":
                 if req[1] in data and (
                     (req[1] in expiry_time and expiry_time[req[1]] >= time() * 1000)
@@ -244,6 +247,7 @@ class Connection(Thread):
             case "replconf":
                 self.sock.send(_encode_resp("OK"))
             case "psync":
+                replicas.append(self.sock)
                 self.sock.send(_encode_resp(f"FULLRESYNC {self.settings.replid} 0"))
                 bres = bytes.fromhex(rdb)
                 self.sock.send(f"${len(bres)}\r\n".encode() + bres)
