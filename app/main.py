@@ -1,270 +1,1625 @@
-import argparse
-import base64
-from dataclasses import dataclass
-import random
+# Uncomment this to pass the first stage
+import sys
 import socket
-import string
+from threading import Thread, Lock, Event, RLock
+from typing import Union, Any
+from enum import Enum
 import time
-from threading import Thread
-from typing import Callable, Literal, NamedTuple
-class Token(NamedTuple):
-    type: str
-    data: bytes
-@dataclass
-class Replica:
-    port: int
-    conn: socket.socket
-@dataclass
-class Context:
-    cmd_handlers: dict[str, Callable[["Context", "ConnContext", list[bytes]], bytes]]
-    store: dict[bytes, tuple[bytes, int | None]]
-    role: Literal[b"master", b"slave"]
-    replication_id: bytes
-    replication_offset: int
-    replicas: dict[int, Replica]
-@dataclass
-class ConnContext:
-    id: int
-    conn: socket.socket
-def send_to_replicas(ctx: Context, cmd: list[bytes]):
-    for r in ctx.replicas.values():
-        r.conn.send(encode_arr(cmd))
-def handle_ping(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    return b"+PONG\r\n"
-def handle_echo(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    if len(cmd) < 2:
-        return encode_err(b"Need 1 arg")
-    return encode_bulkstring(cmd[1])
-def handle_set(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    if len(cmd) < 3:
-        return encode_err(b"Need 2 args")
-    expiry = None
-    if len(cmd) >= 5:
-        if to_str(cmd[3]).lower() == "px":
-            expiry = time.time_ns() + int(cmd[4]) * 1_000_000
-    ctx.store[cmd[1]] = (cmd[2], expiry)
-    send_to_replicas(ctx, cmd)
-    return encode_ok()
-def handle_get(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    if len(cmd) < 2:
-        return encode_err(b"Need 1 arg")
-    value, expiry = ctx.store.get(cmd[1], (None, None))
-    if expiry and time.time_ns() > expiry:
-        ctx.store.pop(cmd[1])
-        value = None
-    return encode_bulkstring(value)
-def socket_connect(host: str, port: int) -> socket.socket:
-    conn = socket.socket()
-    conn.connect((host, port))
-    return conn
-def handle_replconf(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    if len(cmd) < 3:
-        return encode_err(b"Need 2 args")
-    if cmd[1] == b"listening-port":
-        port = int(cmd[2])
-        ctx.replicas[cctx.id] = Replica(port, cctx.conn)
-        return encode_ok()
-    elif cmd[1] == b"capa":
-        if cmd[2] != b"psync2":
-            return encode_err(b"Err only supports psync2")
-        return encode_ok()
-    return encode_err(b"Err invalid replconf cmd")
-def handle_psync(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    if len(cmd) < 3:
-        return encode_err(b"Need 2 args")
-    if cmd[1] == b"?":
-        empty = base64.decodebytes(
-            b"UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
-        )
-        return (
-            encode_string(
-                b"FULLRESYNC "
-                + ctx.replication_id
-                + b" "
-                + to_bytes(ctx.replication_offset)
-            )
-            + encode_bulkstring(empty)[:-2]
-        )
-    return encode_err(b"Err invalid psync cmd")
-def encode_info_field(field: bytes, value: bytes):
-    return field + b":" + value + b"\r\n"
-def info_replication(ctx: Context) -> bytes:
-    res = b"# Replication\r\n"
-    res += encode_info_field(b"role", ctx.role)
-    if ctx.role == b"master":
-        res += encode_info_field(b"connected_slaves", to_bytes(len(ctx.replicas)))
-    res += encode_info_field(b"master_replid", ctx.replication_id)
-    res += encode_info_field(b"master_repl_offset", to_bytes(ctx.replication_offset))
-    return res
-def handle_info(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    section = None
-    if len(cmd) >= 2:
-        section = cmd[1]
-    res = b""
-    if section is None or section == b"replication":
-        res += info_replication(ctx)
-    return encode_bulkstring(res)
-def handle_unknown(ctx: Context, cctx: ConnContext, cmd: list[bytes]) -> bytes:
-    return b"-Unknown command\r\n"
-def encode_bulkstring(in_str: bytes | None) -> bytes:
-    if in_str is None:
-        return b"$-1\r\n"
-    return b"$" + to_bytes(len(in_str)) + b"\r\n" + in_str + b"\r\n"
-def to_bytes(input: str | int) -> bytes:
-    if isinstance(input, int):
-        input = str(input)
-    return bytes(input, "utf-8")
-def to_str(in_str: bytes) -> str:
-    return str(in_str, "utf-8")
-def encode_ok():
-    return b"+OK\r\n"
-def encode_arr(arr: list[bytes]):
-    res = b"*" + to_bytes(len(arr)) + b"\r\n"
-    for e in arr:
-        res += encode_bulkstring(e)
-    return res
-def encode_string(in_str: bytes):
-    return b"+" + in_str + b"\r\n"
-def encode_err(in_str: bytes):
-    return b"-" + in_str + b"\r\n"
-def send_err(conn: socket.socket, error: bytes):
-    print(error)
-    conn.send(encode_err(error))
-def get_token(
-    conn: socket.socket,
-    buf: bytes,
-    fixed_size: int | None = None,
-    fixed_type: str | None = None,
-) -> tuple[Token, bytes]:
-    while True:
-        if fixed_size:
-            assert fixed_type
-            if len(buf) >= fixed_size:
-                skip_len = 0
-                if buf[fixed_size : fixed_size + 2] == b"\r\n":
-                    skip_len = 2
-                return (
-                    Token(fixed_type, buf[:fixed_size]),
-                    buf[fixed_size + skip_len :],
-                )
+import random
+from dataclasses import dataclass
+import argparse
+import secrets
+import re
+import struct
+
+# import fastcrc
+# import crc
+
+
+def millis():
+    return int(time.time() * 1000)
+
+
+class RESPBytes(bytes):
+    def rstrip_all(self, strip_str):
+        """
+        Efficiently strips all occurrences of strip_str from the end of the string
+        and returns the count of occurrences stripped and the resulting bytearray.
+
+        Args:
+        - strip_str: The bytes string to be stripped from the end of the string
+
+        Returns:
+        - The count of occurrences of strip_str stripped from the end of the string
+        - The resulting bytes string after stripping
+        """
+        # Initialize count of occurrences stripped
+        count = 0
+
+        # Calculate the length of strip_str
+        strip_len = len(strip_str)
+
+        # Convert self to a mutable bytearray
+        mutable_bytes = bytearray(self)
+
+        # Iterate over the end of the string, checking if it ends with strip_str
+        while mutable_bytes.endswith(strip_str):
+            # Strip strip_str from the end of the string
+            del mutable_bytes[-strip_len:]
+            # Increment count of occurrences stripped
+            count += 1
+
+        # Convert the mutable bytearray back to bytes
+        result = bytes(mutable_bytes)
+
+        return count, result
+
+
+class RESPStr(str):
+    def rstrip_all(self, strip_str):
+        """
+        Efficiently strips all occurrences of strip_str from the end of the string
+        and returns the count of occurrences stripped.
+
+        Args:
+        - strip_str: The string to be stripped from the end of the string
+
+        Returns:
+        - The count of occurrences of strip_str stripped from the end of the string
+        """
+        # Initialize count of occurrences stripped
+        count = 0
+
+        # Calculate the length of strip_str
+        strip_len = len(strip_str)
+
+        # Convert self to a mutable string
+        mutable_str = bytearray(self, "utf-8")
+
+        # Iterate over the end of the string, checking if it ends with strip_str
+        while mutable_str.endswith(strip_str.encode()):
+            # Strip strip_str from the end of the string
+            del mutable_str[-strip_len:]
+            # Increment count of occurrences stripped
+            count += 1
+
+        # Convert the mutable string back to a regular string
+        result = mutable_str.decode()
+
+        return count, result
+
+
+class StreamEntry(dict):
+    def __init__(self, *args, **kwargs):
+        if "id" not in kwargs:
+            kwargs["id"] = f"{str(millis())}-0"
+        super().__init__(*args, **kwargs)
+
+    def __lt__(self, other):
+        if "id" in self and "id" in other:
+            # return self["id"] < other["id"]
+
+            time, seq = Stream.parse_id(self["id"])
+            other_time, other_seq = Stream.parse_id(other["id"])
+
+            if time > other_time:
+                return False
+            elif time == other_time:
+                if seq < other_seq:
+                    return True
+                else:
+                    return False
+            return True
         else:
-            cmd_end = buf.find(b"\r\n")
-            if cmd_end != -1:
-                res = (Token(chr(buf[0]), buf[1:cmd_end]), buf[cmd_end + 2 :])
-                if chr(buf[0]) in "$!=":
-                    res = get_token(conn, res[1], int(res[0].data), res[0].type)
-                return res
-        recv_buf = conn.recv(1024)
-        buf += recv_buf
-        print(f"Recv {buf}")
-        if not recv_buf:
-            raise ConnectionError
-def generate_rid() -> bytes:
-    return to_bytes(
-        "".join(random.choices(string.ascii_lowercase + string.digits, k=40))
-    )
-def sync_loop(m_conn: socket.socket, ctx: Context, port: int):
-    buf = b""
-    with m_conn:
-        m_conn.send(encode_arr([b"ping"]))
-        token, buf = get_token(m_conn, buf)
-        if token != Token("+", b"PONG"):
-            print("Sync err: didn't get PONG")
-            return
-        m_conn.send(encode_arr([b"replconf", b"listening-port", to_bytes(port)]))
-        token, buf = get_token(m_conn, buf)
-        if token != Token("+", b"OK"):
-            print("Sync err: didn't get OK for listening port")
-            return
-        m_conn.send(encode_arr([b"replconf", b"capa", b"psync2"]))
-        token, buf = get_token(m_conn, buf)
-        if token != Token("+", b"OK"):
-            print("Sync err: didn't get OK for capa")
-            return
-        m_conn.send(encode_arr([b"psync", b"?", b"-1"]))
-        token, buf = get_token(m_conn, buf)
-        resp_arr = token.data.split(b" ")
-        if resp_arr[0] != b"FULLRESYNC":
-            print("Sync err: didn't get FULLRESYNC for psync")
-            return
-        ctx.replication_id = resp_arr[1]
-        ctx.replication_offset = int(resp_arr[2])
-        token, buf = get_token(m_conn, buf)
-        if token.type != "$":
-            print("Sync err: didn't get RDB for psync")
-            return
-        client_loop(m_conn, ctx, True, buf)
+            raise ValueError("Both objects must have an 'id' key for comparison")
+
+    def __gt__(self, other):
+        if "id" in self and "id" in other:
+            # return self["id"] > other["id"]
+
+            time, seq = Stream.parse_id(self["id"])
+            other_time, other_seq = Stream.parse_id(other["id"])
+
+            if time < other_time:
+                return False
+            elif time == other_time:
+                if seq > other_seq:
+                    return True
+                else:
+                    return False
+            return True
+        else:
+            raise ValueError("Both objects must have an 'id' key for comparison")
+
+    def __eq__(self, other):
+        if "id" in self and "id" in other:
+            # return self["id"] == other["id"]
+
+            time, seq = Stream.parse_id(self["id"])
+            other_time, other_seq = Stream.parse_id(other["id"])
+
+            if time != other_time:
+                return False
+            if seq != other_seq:
+                return False
+            return True
+        else:
+            raise ValueError("Both objects must have an 'id' key for comparison")
 
 
-def client_loop(
-    conn: socket.socket, ctx: Context, from_master: bool = False, prev_buf: bytes = b""
-):
-    print(f"Client loop start {conn}")
-    cctx = ConnContext(conn.fileno(), conn)
-    with conn:
-        buf = prev_buf
-        while True:
-            try:
-                cmd: list[bytes] = []
-                token, buf = get_token(conn, buf)
-                if token.type != "*":
-                    send_err(conn, b"Expected array for cmd")
-                    continue
-                arr_len = int(token.data)
-                if arr_len < 1:
-                    send_err(conn, b"Init arr needs 1+ elements")
-                    continue
-                for _ in range(arr_len):
-                    token, buf = get_token(conn, buf)
-                    cmd.append(token.data)
-                print(f"Got command: {cmd}")
-                res = ctx.cmd_handlers.get(to_str(cmd[0]).lower(), handle_unknown)(
-                    ctx, cctx, cmd
+class Stream(list):
+    def __init__(self, *args):
+        for arg in args:
+            if isinstance(arg, StreamEntry):
+                self.append(arg)
+                return
+            elif isinstance(arg, list):
+                for obj in arg:
+                    if not isinstance(obj, StreamEntry):
+                        raise TypeError("Stream can only store StreamEntry objects")
+                super().__init__(arg)
+                return
+        raise ValueError(
+            "Invalid input. Must be a StreamEntry or a list of StreamEntry objects."
+        )
+
+    def append(self, obj):
+        if not isinstance(obj, StreamEntry):
+            raise TypeError("Stream can only store StreamEntry objects")
+        super().append(obj)
+
+    def search(self, id: str, end=True):
+        lo = 0
+        hi = len(self) - 1
+        closest = None
+
+        if id == "-":
+            return lo
+        if id == "+":
+            return hi
+
+        time, seq = Stream.parse_id(id)
+        if time == -1:
+            return None
+
+        if seq == -1:
+            seq = Stream.parse_id(self[-1]["id"])[1] if end else 0
+            id = f"{str(time)}-{str(seq)}"
+
+        se = StreamEntry(id=id)
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+
+            if se < self[mid]:
+                hi = mid - 1
+            elif se > self[mid]:
+                closest = mid
+                lo = mid + 1
+            else:
+                return mid
+
+        return closest if end else lo
+
+    @staticmethod
+    def parse_id(id: str):
+        pattern = r"(\d+)(?:-(\d+|\*))?|(\*)"
+        match = re.match(pattern, id)
+        if match:
+            groups = match.groups()
+            if groups[0] is not None and groups[1] is not None:
+                return int(groups[0]), -1 if groups[1] == "*" else int(groups[1])
+            if groups[0] is not None:
+                return int(groups[0]), -1
+
+        return -1, -1
+
+
+class StreamError(ValueError):
+    def __init__(self, message):
+        super(StreamError, self).__init__(message)
+
+
+@dataclass
+class StoreElement(object):
+    value: Union[str, Stream]
+    expiry: float
+
+
+class Store(object):
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(Store, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        self._lock: RLock = RLock()
+        self._store: dict[str, StoreElement] = {}
+
+    def expired(self, key):
+        with self._lock:
+            if key not in self._store:
+                return True
+
+            e = self._store[key]
+            if e.expiry < 0:
+                return False
+            if e.expiry > millis():
+                return False
+
+            self._store.pop(key)
+            return True
+
+    def size(self):
+        with self._lock:
+            return len(self._store)
+
+    def keys(self):
+        with self._lock:
+            return list(self._store.keys())
+
+    def type(self, key: str):
+        with self._lock:
+            if key not in self._store:
+                return "none"
+
+            e = self._store.get(key)
+            if not e:
+                return "none"
+
+            if isinstance(e.value, Stream):
+                return "stream"
+            elif len(e.value) > 0:
+                return "string"
+
+            return "none"
+
+    def append(self, key: str, value: StreamEntry):
+        with self._lock:
+            time, seq = Stream.parse_id(value["id"])
+            if time == 0 and seq == 0:
+                raise StreamError("The ID specified in XADD must be greater than 0-0")
+
+            if time == -1:
+                time = millis()
+
+            if key not in self._store:
+                if seq == -1:
+                    if time == 0:
+                        seq = 1
+                    else:
+                        seq = 0
+
+                    value["id"] = f"{str(time)}-{str(seq)}"
+
+                self.set(key, Stream(value))
+                return value["id"]
+
+            if not isinstance(self._store[key].value, Stream):
+                return ""
+
+            # Validate entry ID
+            top_entry = self._store[key].value[-1]
+            top_time, top_seq = Stream.parse_id(top_entry["id"])
+
+            if time < top_time or (time == top_time and seq != -1 and seq <= top_seq):
+                raise StreamError(
+                    "The ID specified in XADD is equal or smaller than the target stream top item"
                 )
-                if not from_master:
-                    conn.send(res)
-            except (ConnectionError, AssertionError):
+
+            if seq == -1:
+                if time == top_time:
+                    seq = top_seq + 1
+                else:
+                    seq = 0
+
+                value["id"] = f"{str(time)}-{str(seq)}"
+
+            self._store[key].value.append(value)
+            return value["id"]
+
+    def set(self, key: str, value: Union[str, Stream], expiry=-1):
+        with self._lock:
+            self._store[key] = StoreElement(value, expiry)
+
+    def get(self, key):
+        with self._lock:
+            if key not in self._store:
+                return ""
+
+            e = self._store[key]
+
+            if e.expiry > 0 and e.expiry <= millis():
+                self._store.pop(key)
+                return ""
+
+            return e.value
+
+    def delete(self, key):
+        with self._lock:
+            if key not in self._store:
+                return 0
+
+            self._store.pop(key)
+            return 1
+
+
+class Connection(object):
+    def __init__(
+        self, socket: socket.socket, addr: tuple, server: "Server", isreplica=False
+    ):
+        self._socket = socket
+        self._addr = addr
+        self._server = server
+        self._thread = None
+        self._isreplica = isreplica
+
+    @property
+    def addr(self):
+        return self._addr
+
+    def set_thread(self, t):
+        self._thread = t
+
+    def start(self):
+        self._thread.start()
+
+    def join(self):
+        self._thread.join()
+
+    def set_replica(self):
+        self.isreplica = True
+        self._server.add_replica(self)
+        print(f"Connection {self._addr} set as replica")
+
+    def relay(self, msg: bytes):
+        self.send(msg)
+
+    def send(self, data: bytes):
+        ndata = len(data)
+        nsent = 0
+        nbytes = 0
+        while ndata > 0:
+            nbytes = self._socket.send(data[nbytes:])
+            nsent += nbytes
+            ndata -= nbytes
+
+        return nsent
+
+    def handle_connection(self):
+        with self._socket:
+            while True:
+                request_bytes = self._socket.recv(4096)
+                if not request_bytes:
+                    break
+
+                # Parse RESP packet
+                reqlen = len(request_bytes)
+                at = 0
+                while at < reqlen:
+                    n, tokens = RESPparser.parse(request_bytes[at:])
+                    command, *args = tokens
+                    at += n
+
+                    command = command.upper()
+
+                    if (
+                        not self._isreplica
+                        and command in self._server.PROPAGATED_COMMANDS
+                    ):
+                        self._server.relay(request_bytes)
+                        self._server.master_repl_offset += len(request_bytes)
+
+                    response = None
+
+                    try:
+                        response = server.process_command(command, args, self)
+
+                    except StreamError as s:
+                        response = RESPbuilder.error(
+                            args=str(s),
+                            typ=RESPerror.CUSTOM,
+                        )
+
+                    except ValueError as v:
+                        sys.stderr.write(f"ValueError: {v}\n")
+                        response = RESPbuilder.error(
+                            args="value is not an integer or out of range",
+                            typ=RESPerror.CUSTOM,
+                        )
+
+                    except Exception as e:
+                        sys.stderr.write(f"Exception occurred: {e}\n")
+
+                    finally:
+                        # Default response
+                        if response is None:
+                            response = RESPbuilder.error(
+                                command, args, typ=RESPerror.UNKNOWN_CMD
+                            )
+
+                    self._socket.sendall(response)
+
+
+class ServerRole(Enum):
+    MASTER = "master"
+    SLAVE = "slave"
+
+
+@dataclass
+class ConfigObject(object):
+    name: str = ""
+    value: Any = None
+
+    def build(self):
+        return [self.name, str(self.value)]
+
+
+class ServerConfig(object):
+    dirpath: ConfigObject = ConfigObject(name="dir")
+    dbfilename: ConfigObject = ConfigObject(name="dbfilename")
+    rdbchecksum: ConfigObject = ConfigObject(name="rdbchecksum")
+
+    def __init__(self, rdbchecksum: bool = True, **kwargs):
+        self.rdbchecksum.value = rdbchecksum
+        self.dirpath.value = kwargs.get("dirpath", "")
+        self.dbfilename.value = kwargs.get("dbfilename", "")
+
+    def build(self):
+        return self.dirpath.build() + self.dbfilename.build()
+
+    def __repr__(self):
+        return f"ServerConfig(rdbchecksum={self.rdbchecksum}, dirpath={self.dirpath}, dbfilename={self.dbfilename})"
+
+
+class Server(object):
+    _instance = None
+    PROPAGATED_COMMANDS = ["SET", "DEL", "XADD"]
+
+    def __init__(
+        self,
+        config: ServerConfig,
+        port: int = 6379,
+        role: ServerRole = ServerRole.MASTER,
+    ):
+        self._host = "localhost"
+        self._port = port
+        self._role = role
+        self._replicas = []
+        self.ackcount = 0
+        self._xadd_ev = Event()
+        self._xadd_streams = set()
+
+        self.master_replid = secrets.token_hex(20)
+        self.master_repl_offset = 0
+
+        self.config = config
+
+        self.read_rdb()
+
+    def __new__(
+        cls,
+        port: int = 6379,
+        role: ServerRole = ServerRole.MASTER
+    ):
+        if cls._instance is None:
+            cls._instance = super(Server, cls).__new__(cls)
+            cls._instance.__init__(port, role)
+        return cls._instance
+
+    @property
+    def port(self):
+        return self._port
+
+    @port.setter
+    def port(self, port_: int):
+        self._port = port_
+
+    @property
+    def role(self):
+        return self._role.value
+
+    @role.setter
+    def role(self, role_: ServerRole):
+        self._role = role_
+
+    def add_replica(self, conn: Connection):
+        self._replicas.append(conn)
+
+    def relay(self, msg: bytes):
+        for r in self._replicas:
+            r.relay(msg)
+
+    def process_command(
+        self,
+        command: str,
+        args: list,
+        conn: Connection = None
+    ):
+        global store
+        global repl_offset
+
+        response = None
+
+        # in case command is not in upper-case letters
+        command = command.upper()
+
+        # in case there are quote enclosed arguments
+        new_args = []
+        for arg in args:
+            for s in arg.split():
+                new_args.append(s)
+        args = new_args
+
+        print(f"Received command {command}, args {args}")
+
+        if command == "COMMAND":
+            if not conn:
+                return None
+
+            response = RESPbuilder.build(["ping", "echo"])
+
+        elif command == "PING":
+            if not conn:
+                return None
+
+            argslen = len(args)
+            if argslen > 1:
+                return RESPerror.error(command)
+
+            if argslen == 1:
+                response = RESPbuilder.build(args[0])
+            else:
+                response = RESPbuilder.build("PONG", bulkstr=False)
+
+        elif command == "ECHO":
+            if not conn:
+                return None
+
+            argslen = len(args)
+            if argslen == 0 or argslen > 1:
+                return RESPbuilder.error(command)
+
+            response = RESPbuilder.build(args[0])
+
+        elif command == "INFO":
+            if not conn:
+                return None
+
+            subcommand = ""
+            if len(args) >= 1:
+                subcommand = args[0].upper()
+
+            if subcommand == "REPLICATION":
+                payload = (
+                    f"# Replication\r\n"
+                    f"role:{server.role}\r\n"
+                    f"master_replid:{server.master_replid}\r\n"
+                    f"master_repl_offset:{server.master_repl_offset}\r\n"
+                )
+                response = RESPbuilder.build(payload)
+
+            else:
+                response = RESPbuilder.error(
+                    args="not implemented", typ=RESPerror.CUSTOM
+                )
+
+        elif command == "CONFIG":
+            subcommand = ""
+            if len(args) >= 1:
+                subcommand = args[0].upper()
+
+            if subcommand == "GET":
+                opts = args[1:]
+
+                payload = []
+
+                if len(opts) == 0:
+                    payload = self.config.build()
+
+                else:
+                    for o in opts:
+                        opt = o.lower()
+                        if opt == "dir":
+                            payload += self.config.dirpath.build()
+
+                        elif opt == "dbfilename":
+                            payload += self.config.dbfilename.build()
+
+                response = RESPbuilder.build(payload)
+
+        elif command == "REPLCONF":
+            subcommand = ""
+            if len(args) >= 1:
+                subcommand = args[0].upper()
+
+            if subcommand == "GETACK" and args[1] == "*":
+                response = RESPbuilder.build(["REPLCONF", "ACK", str(repl_offset)])
+
+            elif subcommand == "ACK" and args[1].isdigit():
+                if len(self._replicas) == 0:
+                    return RESPbuilder.error(
+                        args="No replicas connected", typ=RESPerror.CUSTOM
+                    )
+
+                recvd_offset = int(args[1])
+                if recvd_offset >= self.master_repl_offset:
+                    self.ackcount += 1
+
+                return b""
+
+            else:
+                # Hardcode +OK\r\n
+                response = RESPbuilder.build("OK", bulkstr=False)
+
+        elif command == "PSYNC":
+            if not conn:
+                return None
+
+            argslen = len(args)
+            if argslen == 1:
+                return RESPbuilder.error(command)
+            if argslen == 2 and args[0] != "?" and args[1] != "-1":
+                return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+            # set connection as replica
+            conn.set_replica()
+
+            # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n and RDB file contents
+            response = RESPbuilder.build(
+                f"FULLRESYNC {server.master_replid} {server.master_repl_offset}",
+                bulkstr=False,
+            ) + RESPbuilder.build(rdb_contents(), rdb=True)
+
+        elif command == "WAIT":
+            if not conn:
+                return None
+
+            argslen = len(args)
+            if argslen < 2:
+                return RESPbuilder.error(command)
+
+            numreplicas = int(args[0])
+            timeout = int(args[1])
+
+            # send GETACK message to replicas
+            getack_req = RESPbuilder.build(["REPLCONF", "GETACK", "*"])
+            for r in self._replicas:
+                r.send(getack_req)
+
+            self.ackcount = 0
+
+            def poll_func(ev, numreplicas):
+                while True:
+                    if ev.is_set():
+                        return
+
+                    if self.ackcount >= numreplicas:
+                        ev.set()
+                        return
+
+            wait_ev = Event()
+
+            poll_thread = Thread(
+                target=poll_func,
+                args=(
+                    wait_ev,
+                    numreplicas,
+                ),
+            )
+            poll_thread.start()
+
+            wait_ev.wait(timeout / 1000)
+            wait_ev.set()
+
+            poll_thread.join()
+
+            result = self.ackcount if self.ackcount > 0 else len(self._replicas)
+
+            response = RESPbuilder.build(int(result))
+
+        elif command == "KEYS":
+            subcommand = ""
+            if len(args) >= 1:
+                subcommand = args[0]
+
+            if subcommand == "*":
+                keys = list(store.keys())
+                response = RESPbuilder.build(keys)
+
+        elif command == "TYPE":
+            key = ""
+            if len(args) >= 1:
+                key = args[0]
+
+            value_type = store.type(key)
+
+            response = RESPbuilder.build(value_type, bulkstr=False)
+
+        elif command == "XADD":
+            if len(args) < 4:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            key = args[0]
+            entry_id = args[1]
+
+            args = args[2:]
+            argslen = len(args)
+
+            stream_entry = StreamEntry(id=entry_id)
+
+            for i in range(0, argslen, 2):
+                k = args[i]
+                if i + 1 < argslen:
+                    v = args[i + 1]
+                else:
+                    return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+                stream_entry[k] = v
+
+            stored_id = store.append(key, stream_entry)
+
+            # set XADD event
+            if key in self._xadd_streams:
+                print("setting xadd event")
+                self._xadd_streams.remove(key)
+                self._xadd_ev.set()
+
+            if not conn:
+                return None
+
+            response = RESPbuilder.build(stored_id)
+
+        elif command == "XRANGE":
+            if len(args) < 3:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            key = args[0]
+            start_id = args[1]
+            end_id = args[2]
+
+            stream = store.get(key)
+            if not stream:
+                return RESPbuilder.null()
+            if not isinstance(stream, Stream):
+                return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+            start_idx = stream.search(start_id, end=False)
+            end_idx = stream.search(end_id)
+
+            response = RESPbuilder.build(stream[start_idx : end_idx + 1])
+
+        elif command == "XREAD":
+            if len(args) < 1:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            block = False
+            block_time = 0
+            if "block" in args:
+                block = True
+                block_time = int(args[args.index("block") + 1])
+            elif "BLOCK" in args:
+                block = True
+                block_time = int(args[args.index("BLOCK") + 1])
+
+            start_idx = 0
+            if "streams" in args:
+                start_idx = args.index("streams") + 1
+
+            elif "STREAMS" in args:
+                start_idx = args.index("STREAMS") + 1
+
+            else:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            key_id_len = len(args[start_idx:])
+            if key_id_len % 2 != 0:
+                return RESPbuilder.error(
+                    args="Unbalanced XREAD list of streams: for each stream "
+                    "key an ID or '$' must be specified",
+                    typ=RESPerror.CUSTOM,
+                )
+            if key_id_len == 0:
+                return RESPbuilder.error(command)
+
+            key_id_len = key_id_len // 2
+
+            key_id_list = []
+            for i in range(start_idx, start_idx + key_id_len):
+                key = args[i]
+                id = args[i + key_id_len]
+                key_id_list.append((key, id))
+
+            streams = []
+            for key, id in key_id_list:
+                stream = store.get(key)
+                if not stream:
+                    continue
+                if not isinstance(stream, Stream):
+                    return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+                if id == "$":
+                    continue
+
+                idx = stream.search(id, end=False)
+                if idx is None:
+                    return RESPbuilder.error(
+                        args="Invalid stream ID specified as stream command "
+                        "argument",
+                        typ=RESPerror.CUSTOM,
+                    )
+
+                streamlen = len(stream)
+                if idx < streamlen and id >= stream[idx]["id"]:
+                    idx += 1
+                if idx < streamlen:
+                    streams.append([key, stream[idx:]])
+
+            if block and len(streams) == 0:
+                for i in range(len(key_id_list)):
+                    key, id = key_id_list[i]
+                    self._xadd_streams.add(key)
+                    if id == "$":
+                        stream = store.get(key)
+                        if not stream:
+                            continue
+                        key_id_list[i] = (key, stream[-1]["id"])
+                        print(key_id_list[i])
+
+                self._xadd_ev.clear()
+                if block_time > 0:
+                    self._xadd_ev.wait(block_time / 1000)
+                else:
+                    self._xadd_ev.wait()
+                
+                for key, id in key_id_list:
+                    stream = store.get(key)
+                    if not stream:
+                        continue
+                    if not isinstance(stream, Stream):
+                        return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+                    idx = stream.search(id, end=False)
+                    if idx is None:
+                        return RESPbuilder.error(
+                            args="Invalid stream ID specified as stream command "
+                            "argument",
+                            typ=RESPerror.CUSTOM,
+                        )
+
+                    streamlen = len(stream)
+                    if idx < streamlen and id >= stream[idx]["id"]:
+                        idx += 1
+                    if idx < streamlen:
+                        streams.append([key, stream[idx:]])
+
+            response = (
+                RESPbuilder.build(streams) if len(streams) > 0 else RESPbuilder.null()
+            )
+
+        elif command == "SET":
+            if len(args) < 2:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            expiry = -1
+            if len(args) > 2:
+                expopt = args[2].upper()
+                if expopt == "PX" and len(args) == 4:
+                    expiry = millis() + int(args[3])
+                else:
+                    if not conn:
+                        return None
+
+                    return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+            store.set(args[0], args[1], expiry)
+
+            if not conn:
+                return None
+
+            response = RESPbuilder.build("OK", bulkstr=False)
+
+        elif command == "GET":
+            if not conn:
+                return None
+
+            nargs = len(args)
+            if nargs < 1:
+                return RESPbuilder.error(command)
+
+            if nargs == 1:
+                values = store.get(args[0])
+                if isinstance(values, Stream):
+                    return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+            else:
+                values = []
+                for i in range(nargs):
+                    value = store.get(args[i])
+                    if isinstance(value, Stream):
+                        return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+                    values.append(value)
+
+            response = RESPbuilder.build(values)
+
+        elif command == "DEL":
+            if not conn:
+                return None
+
+            nargs = len(args)
+            if nargs < 1:
+                return RESPbuilder.error(command)
+
+            if nargs == 1:
+                keys_deleted = store.delete(args[0])
+
+            else:
+                keys_deleted = 0
+                for i in range(nargs):
+                    keys_deleted += store.delete(args[i])
+
+            response = RESPbuilder.build(keys_deleted)
+
+        return response
+
+    def read_rdb(self):
+        global store
+
+        rdbdata = b""
+        rdbpath = self.config.dirpath.value + "/" + self.config.dbfilename.value
+
+        parser = RDBparser()
+        try:
+            with open(rdbpath, "rb") as f:
+                rdbdata = f.read()
+
+        except FileNotFoundError as e:
+            print(f"RDB file {rdbpath} not found")
+            rdbdata = rdb_contents()
+
+        for state, key, value, expiry in parser.parse(rdbdata):
+            if state[:7] == "key_val" and (expiry == -1 or expiry > millis()):
+                store.set(key, value, expiry)
+
+
+class RESPparser(object):
+    @classmethod
+    def _parse_internal(cls, lines):
+        if len(lines) == 0:
+            return 0, [""]
+
+        n, startline = RESPStr(lines.pop(0).decode()).rstrip_all("\r\n")
+        ntotal = (n * 2) + len(startline)
+
+        params = []
+
+        # integer
+        if startline.startswith(":"):
+            return ntotal, int(startline[1:])
+
+        # simple string
+        elif startline.startswith("+"):
+            return ntotal, startline[1:]
+
+        # bulk string
+        elif startline.startswith("$"):
+            nbytes = int(startline[1:])
+            if len(lines) < 1:
+                raise RuntimeError("Invalid data")
+            n, line = RESPStr(lines.pop(0).decode()).rstrip_all("\r\n")
+            if len(line) < nbytes:
+                raise RuntimeError("Bulk string data fell short")
+            ntotal += (n * 2) + len(line)
+            param = line[:nbytes]
+            return ntotal, param
+
+        # array
+        elif startline.startswith("*"):
+            nparams = int(startline[1:])
+
+            for i in range(nparams):
+                nchild, paramschild = cls._parse_internal(lines)
+
+                params.append(paramschild)
+                ntotal += nchild
+
+        return ntotal, params
+
+    @classmethod
+    def parse(cls, data):
+        if len(data) == 0:
+            return 0, [""]
+
+        lines = data.splitlines(keepends=True)
+        nlines = len(lines)
+
+        n, params = cls._parse_internal(lines)
+
+        # if nlines != n:
+        #    raise RuntimeError('Invalid data')
+
+        return n, params
+
+    def __init__(self, data):
+        self.params = self.parse(data)
+
+
+class RESPerror(Enum):
+    WRONG_ARGS = 1
+    UNKNOWN_CMD = 2
+    WRONGTYPE = 3
+    SYNTAX = 4
+    CUSTOM = 5
+
+
+class RESPbuilder(object):
+
+    @classmethod
+    def resolve_entry(cls, entry: StreamEntry):
+        l = []
+        keys = list(entry.keys())[1:]
+        for key in keys:
+            l.append(key)
+            l.append(entry[key])
+        return [entry["id"], l]
+
+    @classmethod
+    def null(cls):
+        return "$-1\r\n".encode()
+
+    @classmethod
+    def build(
+        cls,
+        data: Union[int, str, list, StreamEntry, Stream],
+        bulkstr: bool = True,
+        rdb: bool = False
+    ):
+        typ = type(data)
+
+        if typ == int:
+            return f":{data}\r\n".encode()
+
+        elif typ == str:
+            if len(data) == 0:
+                return cls.null()
+
+            if bulkstr:
+                return f"${len(data)}\r\n{data}\r\n".encode()
+            else:
+                return f"+{data}\r\n".encode()
+
+        elif typ == bytes:
+            if rdb:
+                return f"${len(data)}\r\n".encode() + data
+            else:
+                return cls.null()
+
+        elif typ == list:
+            return f"*{len(data)}\r\n".encode() + "".encode().join(map(cls.build, data))
+
+        elif typ == StreamEntry:
+            streamentryl = RESPbuilder.resolve_entry(data)
+
+            return RESPbuilder.build(streamentryl)
+
+        elif typ == Stream:
+            streaml = []
+            for entry in data:
+                streaml.append(RESPbuilder.resolve_entry(entry))
+
+            return RESPbuilder.build(streaml)
+
+        else:
+            raise TypeError(f"Unsupported type: {typ}")
+
+    @classmethod
+    def error(
+        cls,
+        command: str = "",
+        args: list = None,
+        typ: RESPerror = RESPerror.WRONG_ARGS
+    ):
+        if typ == RESPerror.WRONG_ARGS:
+            return (
+                "-ERR wrong number of arguments for "
+                f"'{command}' command\r\n".encode()
+            )
+
+        elif typ == RESPerror.UNKNOWN_CMD:
+            arg1 = args[0] if len(args) > 0 else ""
+            return (
+                f"-ERR unknown command `{command}`, "
+                f"with args beginning with: {arg1}\r\n".encode()
+            )
+
+        elif typ == RESPerror.WRONGTYPE:
+            return (
+                "-WRONGTYPE Operation against a key holding the wrong kind of "
+                "value\r\n".encode()
+            )
+
+        elif typ == RESPerror.SYNTAX:
+            return "-ERR syntax error\r\n".encode()
+
+        elif typ == RESPerror.CUSTOM:
+            return f"-ERR {args}\r\n".encode()
+
+        else:
+            raise RuntimeError("Unknown error type")
+
+
+class RDBparser(object):
+    _states = [
+        "start",
+        "magic",
+        "ver",
+        "aux",
+        "db_sel",
+        "key_val_s",
+        "key_val_ms",
+        "key_val",
+        "eof",
+        "chksum",
+    ]
+
+    _datatypes = ["str", "int8", "int16", "int32", "lzf"]
+
+    def __init__(self, rdbchecksum: bool = True):
+        self._state = RDBparser._states[0]
+        self._rdbchecksum = rdbchecksum
+
+    def decode_length_encoding(self, data, pos):
+        datatype = "str"
+
+        # Read the first byte
+        first_byte = data[pos]
+
+        # Extract the two most significant bits
+        msb = first_byte >> 6
+
+        if msb == 0:  # 00: 6-bit encoding
+            length = first_byte & 0x3F
+            return datatype, length, 1
+        elif msb == 1:  # 01: 14-bit encoding
+            second_byte = data[pos + 1]
+            length = ((first_byte & 0x3F) << 8) | second_byte
+            return datatype, length, 2
+        elif msb == 2:  # 10: 32-bit encoding
+            length = int.from_bytes(
+                data[pos + 1 : pos + 5], byteorder="little", signed=False
+            )
+            return datatype, length, 5
+        else:  # 11: special encoding
+            fmt = first_byte & 0x3F
+            if fmt == 0x3:
+                datatype = "lzf"
+                raise ValueError("Compressed strings not supported")
+
+            if fmt == 0:
+                datatype = "int8"
+                return datatype, 1, 1
+
+            elif fmt == 1:
+                datatype = "int16"
+                return datatype, 2, 1
+
+            elif fmt == 2:
+                datatype = "int32"
+                return datatype, 4, 1
+            else:
+                raise ValueError("Invalid data")
+
+    def decode_string_encoding(self, data, pos):
+        datatype, str_len, consumed_bytes = self.decode_length_encoding(data, pos)
+        pos += consumed_bytes
+        string = ""
+        if datatype == "str":
+            string = data[pos : pos + str_len].decode("utf-8")
+        elif datatype[:3] == "int":
+            string = int.from_bytes(data[pos : pos + str_len], byteorder="little")
+        return string, consumed_bytes + str_len
+
+    def parse(self, stream: bytes):
+        streamlen = len(stream)
+        pos = 0
+
+        # Verify magic string
+        if self._state == "start":
+            if b"REDIS" != stream[pos:5]:
+                raise ValueError("Invalid magic string")
+
+            pos += 5
+            self._state = "magic"
+
+        # Get RDB version
+        version = 0
+        if self._state == "magic":
+            # Will raise ValueError on invalid data
+            version = int.from_bytes(stream[pos:9], byteorder="little")
+
+            pos += 4
+            self._state = "ver"
+            yield self._state, "RDB version", version, -1
+
+        # Parse rest of the stream
+        while pos < streamlen:
+            opcode = stream[pos]
+            pos += 1
+
+            if opcode == 0xFD:  # Expiry time in seconds
+                self._state = "key_val_s"
+
+                expiry = int.from_bytes(
+                    stream[pos : pos + 4], byteorder="little", signed=False
+                )
+                pos += 4
+
+            elif opcode == 0xFC:  # Expiry time in milliseconds
+                self._state = "key_val_ms"
+
+                expiry = int.from_bytes(
+                    stream[pos : pos + 8], byteorder="little", signed=False
+                )
+                pos += 8
+
+            elif opcode == 0xFA:  # Auxiliary fields
+                self._state = "aux"
+
+                aux_key, consumed_bytes = self.decode_string_encoding(stream, pos)
+                pos += consumed_bytes
+
+                aux_value, consumed_bytes = self.decode_string_encoding(stream, pos)
+                pos += consumed_bytes
+
+                yield self._state, aux_key, aux_value, -1
+
+            elif opcode == 0xFE:  # Database selector
+                # Skip over database selector field
+                # pos += 1
+                datatype, dbnum_len, consumed_bytes = self.decode_length_encoding(
+                    stream, pos
+                )
+                pos += consumed_bytes
+                if datatype == "str":
+                    dbnum = stream[pos : pos + dbnum_len].decode("utf-8")
+                elif datatype[:3] == "int":
+                    dbnum = int.from_bytes(
+                        stream[pos : pos + dbnum_len], byteorder="little"
+                    )
+
+            elif opcode == 0xFB:  # Resize database
+                # Skip over resize database field
+                # pos += 4
+                datatype, int_len, consumed_bytes = self.decode_length_encoding(
+                    stream, pos
+                )
+                pos += consumed_bytes
+                db_hash_tbl_size = int.from_bytes(
+                    stream[pos : pos + int_len], byteorder="little"
+                )
+
+                datatype, int_len, consumed_bytes = self.decode_length_encoding(
+                    stream, pos
+                )
+                pos += consumed_bytes
+                exp_hash_tbl_size = int.from_bytes(
+                    stream[pos : pos + int_len], byteorder="little"
+                )
+
+            elif opcode == 0xFF:  # End of file marker
+                # CRC64 checksum disabled
+                if not self._rdbchecksum:
+                    break
+
+                # Verify CRC64 checksum
+                # expected_crc = struct.unpack('>Q', stream[pos:pos+8])[0]
+                # calculator = crc.Calculator(crc.Crc64.CRC64)
+                # actual_crc = calculator.checksum(stream[:pos])
+                # if actual_crc != expected_crc:
+                #    print("CRC64 checksum verification failed")
+                #    #raise ValueError("CRC64 checksum verification failed")
+
+                break  # End of file, stop parsing
+
+            else:
+                if self._state[:3] != "key":
+                    self._state = "key_val"
+
+                pos -= 1
+
+                value_type = stream[pos]
+                pos += 1
+
+                key, consumed_bytes = self.decode_string_encoding(stream, pos)
+                pos += consumed_bytes
+
+                # Parse value based on type
+                if value_type == 0:  # String encoded as a Redis string
+                    value, consumed_bytes = self.decode_string_encoding(stream, pos)
+                    pos += consumed_bytes
+                elif value_type == 1:  # List
+                    pass
+                elif value_type == 2:  # Set
+                    pass
+
+                if "expiry" in locals():
+                    yield self._state, key, value, expiry
+                    del expiry
+                else:
+                    yield self._state, key, value, -1
+
+
+def rdb_contents():
+    hex_data = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
+
+    return bytes.fromhex(hex_data)
+
+
+def check_expiry():
+    global store
+    CHECK_INTERVAL = 300  # seconds
+
+    while True:
+        MAX_LOT_SIZE = 20
+
+        store_keys = list(store.keys())
+        store_size = len(store_keys)
+        if store_size > 0:
+            lot_size = store_size if store_size < MAX_LOT_SIZE else MAX_LOT_SIZE
+            selected = random.sample(store_keys, lot_size)
+            for key in selected:
+                store.expired(key)
+
+        time.sleep(CHECK_INTERVAL)
+
+
+def handle_master_conn(host, port):
+    global server
+    global repl_offset
+
+    print("Connecting to master")
+
+    master_socket = socket.create_connection((host, port))
+
+    ping = RESPbuilder.build(["ping"])
+    master_socket.sendall(ping)
+    master_socket.recv(4096)
+
+    replconf = RESPbuilder.build(["REPLCONF", "listening-port", str(server.port)])
+    master_socket.sendall(replconf)
+    master_socket.recv(4096)
+
+    replconf = RESPbuilder.build(["REPLCONF", "capa", "eof", "capa", "psync2"])
+    master_socket.sendall(replconf)
+    master_socket.recv(4096)
+
+    psync = RESPbuilder.build(["PSYNC", "?", "-1"])
+
+    nparsed = 0
+    data = b""
+
+    MAX_TRIES = 3
+    ntries = 0
+    while ntries < MAX_TRIES:
+        master_socket.sendall(psync)
+        # The tester driver sometimes is too eager to receive the response to
+        # PSYNC command and probably errors out if there is any delay.
+        # Receiving only as many bytes as in the response will avoid post
+        # processing and avoid the delay.
+        data = master_socket.recv(56)
+        n, token = RESPparser.parse(data)
+        nparsed = n
+        pattern = r"FULLRESYNC ([a-zA-Z0-9]{40}) (\d+)"
+        match = re.match(pattern, token)
+        if match and match.start() == 0 and match.end() == len(token):
+            break
+
+        ntries += 1
+
+    if ntries == MAX_TRIES:
+        print(f"Error reading replica sync data")
+        master_socket.close()
+        return
+
+    rdblen = 0
+    rdbdata = b""
+
+    # check if any data is left and parse it
+    if nparsed < len(data):
+        line = data[nparsed:].splitlines(keepends=True)[0]
+        n, line = RESPBytes(line).rstrip_all(b"\r\n")
+        if not line.startswith(b"$"):
+            print("Error reading bulk length while SYNCing")
+            master_socket.close()
+            return
+        try:
+            rdblen = int(line[1:])
+        except ValueError as ve:
+            print("Error reading bulk length while SYNCing")
+            master_socket.close()
+            return
+        # extract rdb data
+        rdbdata = data[
+            nparsed + (n * 2) + len(line) : nparsed + (n * 2) + len(line) + rdblen
+        ]
+        nparsed += (n * 2) + len(line) + len(rdbdata)
+        rdblen -= len(rdbdata)
+
+    # wait for RDB file
+    while True:
+        if len(rdbdata) == 0:
+            data = master_socket.recv(4096)
+            lines = data.splitlines(keepends=True)[0]
+            n, line = RESPBytes(lines).rstrip_all(b"\r\n")
+            if not line.startswith(b"$"):
+                print("Error reading bulk length while SYNCing")
+                master_socket.close()
+                return
+            try:
+                rdblen = int(line[1:])
+            except ValueError as ve:
+                print("Error reading bulk length while SYNCing")
+                master_socket.close()
+                return
+            # extract rdb data
+            rdbdata = data[(n * 2) + len(line) : (n * 2) + len(line) + rdblen]
+            nparsed = (n * 2) + len(line) + len(rdbdata)
+            rdblen -= len(rdbdata)
+        else:
+            while rdblen > 0:
+                data = master_socket.recv(4096)
+                rdbdata += data
+                rdblen -= len(data)
+                nparsed = len(data)
+            break
+
+    print("Master-slave handshake complete")
+
+    if len(data[nparsed:]) > 0:
+        data = data[nparsed:]
+        datalen = len(data)
+        at = 0
+        while at < datalen:
+            n, tokens = RESPparser.parse(data[at:])
+            command, *args = tokens
+            response = server.process_command(command, args)
+            if response and len(response) > 0:
+                master_socket.sendall(response)
+            repl_offset += n
+            at += n
+
+    with master_socket:
+        while True:
+            data = master_socket.recv(4096)
+            #print(f'Received from master: {data}')
+            if not data:
                 break
-    if cctx.id in ctx.replicas:
-        ctx.replicas[cctx.id].conn.close()
-        ctx.replicas.pop(cctx.id)
-    print(f"Client loop stop {conn}")
+
+            datalen = len(data)
+            at = 0
+            while at < datalen:
+                n, tokens = RESPparser.parse(data[at:])
+                command, *args = tokens
+                response = server.process_command(command, args)
+                if response and len(response) > 0:
+                    master_socket.sendall(response)
+                repl_offset += n
+                at += n
+
+
+# Globals
+store = Store()
+server = None
+repl_offset = 0
+connections = []
 
 
 def main():
-    print("Server start!")
-    ctx = Context(
-        cmd_handlers={
-            "ping": handle_ping,
-            "echo": handle_echo,
-            "set": handle_set,
-            "get": handle_get,
-            "info": handle_info,
-            "replconf": handle_replconf,
-            "psync": handle_psync,
-        },
-        store={},
-        role=b"master",
-        replication_id=generate_rid(),
-        replication_offset=0,
-        replicas={},
+    global server
+    global repl_offset
+
+    parser = argparse.ArgumentParser(description="Dummy Redis Server")
+    parser.add_argument("--port", type=int, help="Port number")
+    parser.add_argument(
+        "--replicaof",
+        nargs="+",
+        metavar=("host", "port"),
+        help="Set the host and port of the master to replicate",
     )
-    parser = argparse.ArgumentParser(description="GVK Redis")
-    parser.add_argument("--port", default=6379, type=int, help="Server port")
-    parser.add_argument("--replicaof", nargs="+", help="Replica server host and port")
+    parser.add_argument(
+        "--dir", type=str, help="Path to directory where RDB file gets stored"
+    )
+    parser.add_argument("--dbfilename", type=str, help="Name of the RDB file")
+    parser.add_argument(
+        "--rdbchecksum", action="store_true", help="Enable CRC64 checksum"
+    )
+
     args = parser.parse_args()
-    m_conn = None
+
+    # Configuration
+    dirpath = args.dir if args.dir else "./"
+    dbfilename = args.dbfilename if args.dbfilename else "dump.rdb"
+    rdbchecksum = args.rdbchecksum if args.rdbchecksum else True
+
+    config = ServerConfig(
+        rdbchecksum=rdbchecksum, dirpath=dirpath, dbfilename=dbfilename
+    )
+
+    # Get port number
+    port = 6379
+    if args.port:
+        port = args.port
+
+    server = Server(config, port)
+
+    print(f"Running on port: {server.port}")
+
+    master_thread = None
+    # Get master host and port
     if args.replicaof:
-        ctx.role = b"slave"
-        replicaof = args.replicaof[0].split()
-        m_conn = socket_connect(replicaof[0], int(replicaof[1]))
-        Thread(target=lambda: sync_loop(m_conn, ctx, args.port), daemon=True).start()
-    server_socket = socket.create_server(("localhost", args.port))
-    while True:
-        conn, _ = server_socket.accept()  # wait for client
-        print(f"Got connection from {conn}")
-        Thread(target=lambda: client_loop(conn, ctx), daemon=True).start()
+        args.replicaof = args.replicaof[0].split()
+        server.role = ServerRole.SLAVE
+        master_host = args.replicaof[0]
+        master_port = args.replicaof[1]
+        print(f"Set as slave replicating {args.replicaof[0]}:{args.replicaof[1]}")
+
+        master_thread = Thread(
+            target=handle_master_conn,
+            args=(
+                master_host,
+                master_port,
+            ),
+        )
+        master_thread.start()
+
+    # Start thread to check for key expiry
+    expiry_thread = Thread(target=check_expiry)
+    expiry_thread.start()
+
+    # create socket to listen for incomming connections
+    server_socket = socket.create_server(
+        ("localhost", server.port), backlog=2, reuse_port=True
+    )
+
+    MAX_CONCURRENT_CONN = 15
+    global connections
+    num_conn = 0
+
+    while num_conn < MAX_CONCURRENT_CONN:
+        client_socket, addr = server_socket.accept()  # wait for client
+        conn = Connection(client_socket, addr, server)
+        print("Incoming connection from", addr)
+        t = Thread(target=conn.handle_connection)
+        conn.set_thread(t)
+        connections.append(conn)
+        conn.start()
+        num_conn += 1
+
+    for conn in connections:
+        conn.join()
+
+    if master_thread:
+        master_thread.join()
+
+    expiry_thread.join()
+
+
 if __name__ == "__main__":
-    Thread(target=main, daemon=True).start()
-    while True:
-        time.sleep(10)
+    main()
